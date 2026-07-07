@@ -288,11 +288,16 @@ MACOS_VERSIONS: list[MacOSVersion] = [
 #  HARDWARE DETECTION
 # ═══════════════════════════════════════════════════════════════
 
+IS_WINDOWS = platform.system() == "Windows"
+
+
 def _run(cmd: str, default: str = "") -> str:
     """Run a shell command and return stdout, or default on error."""
     try:
         result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=10
+            cmd, shell=True, capture_output=True, text=True, timeout=10,
+            # Suppress Windows console windows when running subprocesses
+            creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0,
         )
         return result.stdout.strip()
     except Exception:
@@ -303,10 +308,92 @@ def _run_lines(cmd: str) -> list[str]:
     return [l for l in _run(cmd).splitlines() if l.strip()]
 
 
-def detect_cpu() -> CPUInfo:
-    cpu = CPUInfo()
+def _wmic(query: str) -> list[dict]:
+    """Run a WMIC query and return list of dicts (Windows only)."""
+    out = _run(f'wmic {query} /format:list')
+    records, current = [], {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            if current:
+                records.append(current)
+                current = {}
+        elif '=' in line:
+            k, _, v = line.partition('=')
+            current[k.strip()] = v.strip()
+    if current:
+        records.append(current)
+    return records
 
-    # lscpu parsing
+
+def _ps(expression: str) -> str:
+    """Run a PowerShell one-liner (Windows fallback)."""
+    return _run(f'powershell -NoProfile -NonInteractive -Command "{expression}"')
+
+
+def _infer_cpu_flags_from_gen(cpu: "CPUInfo") -> None:
+    """
+    On Windows we can't easily read CPUID flags the way Linux exposes them in
+    /proc/cpuinfo, so we infer common Hackintosh-relevant flags from the CPU
+    generation.  These are conservative lower-bounds (all real CPUs of these
+    generations support these instruction sets).
+    """
+    gen = cpu.generation
+    vendor = cpu.vendor
+    if vendor == "Intel":
+        if gen >= 1:   cpu.has_sse4_2 = True   # Nehalem+
+        if gen >= 2:   cpu.has_avx    = True    # Sandy Bridge+
+        if gen >= 4:   cpu.has_avx2   = True    # Haswell+
+        if gen >= 2:   cpu.has_aes    = True    # Sandy Bridge+
+        if gen >= 1:   cpu.vt_x       = True    # nearly universal
+    elif vendor == "AMD":
+        # Zen = Ryzen 1000+
+        if gen >= 1:   cpu.has_sse4_2 = True
+        if gen >= 1:   cpu.has_avx    = True
+        if gen >= 2:   cpu.has_avx2   = True    # Zen 2 (Ryzen 3000)+
+        if gen >= 1:   cpu.has_aes    = True
+        if gen >= 1:   cpu.vt_x       = True
+
+
+def _detect_cpu_windows() -> "CPUInfo":
+    cpu = CPUInfo()
+    rows = _wmic("cpu get Name,Manufacturer,NumberOfCores,NumberOfLogicalProcessors,"
+                 "MaxClockSpeed,Description,Architecture")
+    if rows:
+        r = rows[0]
+        cpu.brand  = r.get("Name", "Unknown")
+        mfr        = r.get("Manufacturer", "")
+        cpu.vendor = ("Intel" if "Intel" in mfr or "GenuineIntel" in mfr else
+                      "AMD"   if "AMD"   in mfr or "AuthenticAMD" in mfr else mfr)
+        try: cpu.cores   = int(r.get("NumberOfCores", 0))
+        except ValueError: pass
+        try: cpu.threads = int(r.get("NumberOfLogicalProcessors", 0))
+        except ValueError: pass
+        try: cpu.max_mhz = float(r.get("MaxClockSpeed", 0))
+        except ValueError: pass
+
+    # Detect generation, then infer flags
+    if cpu.vendor == "Intel":
+        cpu.generation = _detect_intel_gen(cpu.brand, cpu.family, cpu.model_num)
+    elif cpu.vendor == "AMD":
+        cpu.generation = _detect_amd_gen(cpu.brand)
+
+    # Try reading flags from PowerShell (Win 10/11 supports Get-CimInstance)
+    ps_flags = _ps(
+        "(Get-CimInstance Win32_Processor).Description"
+    ).lower()
+    if "avx2" in ps_flags:   cpu.has_avx2   = True
+    if "avx"  in ps_flags:   cpu.has_avx    = True
+    if "sse4" in ps_flags:   cpu.has_sse4_2 = True
+    if "aes"  in ps_flags:   cpu.has_aes    = True
+
+    # Fall back to generation-based inference for any still-unknown flags
+    _infer_cpu_flags_from_gen(cpu)
+    return cpu
+
+
+def _detect_cpu_linux() -> "CPUInfo":
+    cpu = CPUInfo()
     lscpu_out = _run("lscpu 2>/dev/null")
     for line in lscpu_out.splitlines():
         kv = line.split(":", 1)
@@ -318,47 +405,38 @@ def detect_cpu() -> CPUInfo:
         elif key == "Model name":
             cpu.brand = val
         elif key == "CPU family":
-            try:
-                cpu.family = int(val)
-            except ValueError:
-                pass
+            try: cpu.family = int(val)
+            except ValueError: pass
         elif key == "Model":
-            try:
-                cpu.model_num = int(val)
-            except ValueError:
-                pass
+            try: cpu.model_num = int(val)
+            except ValueError: pass
         elif key == "CPU(s)":
-            try:
-                cpu.threads = int(val)
-            except ValueError:
-                pass
+            try: cpu.threads = int(val)
+            except ValueError: pass
         elif key == "Core(s) per socket":
-            try:
-                cpu.cores = int(val)
-            except ValueError:
-                pass
+            try: cpu.cores = int(val)
+            except ValueError: pass
         elif key == "CPU max MHz":
-            try:
-                cpu.max_mhz = float(val)
-            except ValueError:
-                pass
+            try: cpu.max_mhz = float(val)
+            except ValueError: pass
         elif key == "Virtualization":
             cpu.vt_x = "VT-x" in val or "AMD-V" in val
         elif key == "Flags":
             cpu.flags = val.split()
 
-    cpu.has_avx = "avx" in cpu.flags
-    cpu.has_avx2 = "avx2" in cpu.flags
+    cpu.has_avx    = "avx"    in cpu.flags
+    cpu.has_avx2   = "avx2"   in cpu.flags
     cpu.has_sse4_2 = "sse4_2" in cpu.flags
-    cpu.has_aes = "aes" in cpu.flags
-
-    # Intel generation detection
+    cpu.has_aes    = "aes"    in cpu.flags
     if cpu.vendor == "Intel":
         cpu.generation = _detect_intel_gen(cpu.brand, cpu.family, cpu.model_num)
     elif cpu.vendor == "AMD":
         cpu.generation = _detect_amd_gen(cpu.brand)
-
     return cpu
+
+
+def detect_cpu() -> CPUInfo:
+    return _detect_cpu_windows() if IS_WINDOWS else _detect_cpu_linux()
 
 
 def _detect_intel_gen(brand: str, family: int, model: int) -> int:
@@ -458,7 +536,33 @@ def _detect_amd_gen(brand: str) -> int:
     return 0
 
 
-def detect_gpus() -> list[GPUInfo]:
+def _detect_gpus_windows() -> list[GPUInfo]:
+    gpus = []
+    rows = _wmic("path Win32_VideoController get Name,AdapterCompatibility,"
+                 "VideoProcessor,AdapterRAM")
+    for r in rows:
+        name = r.get("Name", "").strip()
+        if not name or name.lower() in ("microsoft basic display adapter", ""):
+            continue
+        g = GPUInfo()
+        g.name = name
+        compat = r.get("AdapterCompatibility", "")
+        g.vendor = (
+            "Intel"  if "Intel"   in compat or "Intel"  in name else
+            "NVIDIA" if "NVIDIA"  in compat or "NVIDIA" in name or "nVidia" in name else
+            "AMD"    if "AMD"     in compat or "AMD"    in name
+                     or "Radeon"  in name    or "Advanced Micro" in compat else
+            compat or "Unknown"
+        )
+        g.is_igpu = g.vendor == "Intel" and any(
+            k in name for k in ("Iris", "UHD", "HD Graphics", "GMA")
+        )
+        g.generation = _gpu_generation(g.vendor, g.name)
+        gpus.append(g)
+    return gpus
+
+
+def _detect_gpus_linux() -> list[GPUInfo]:
     gpus = []
     lspci = _run("lspci -vmm 2>/dev/null")
     current: dict = {}
@@ -469,13 +573,12 @@ def detect_gpus() -> list[GPUInfo]:
                                                       "display controller"):
                 g = GPUInfo()
                 vendor_str = current.get("Vendor", "")
-                svid = current.get("SVendor", "")
-                g.name = current.get("Device", "Unknown")
+                g.name   = current.get("Device", "Unknown")
                 g.pci_id = current.get("SDevice", "")
                 g.vendor = (
-                    "Intel" if "Intel" in vendor_str else
+                    "Intel"  if "Intel" in vendor_str else
                     "NVIDIA" if "NVIDIA" in vendor_str or "nVidia" in vendor_str else
-                    "AMD" if "AMD" in vendor_str or "Advanced Micro" in vendor_str else
+                    "AMD"    if "AMD" in vendor_str or "Advanced Micro" in vendor_str else
                     vendor_str
                 )
                 g.is_igpu = "Intel" in vendor_str and (
@@ -490,22 +593,24 @@ def detect_gpus() -> list[GPUInfo]:
             if len(kv) == 2:
                 current[kv[0].strip()] = kv[1].strip()
 
-    # Fallback: simple lspci grep
-    if not gpus:
+    if not gpus:  # Fallback: simple grep
         for line in _run_lines("lspci 2>/dev/null | grep -iE 'vga|3d|display'"):
             g = GPUInfo()
-            g.name = line.split(":", 1)[-1].strip()
+            g.name   = line.split(":", 1)[-1].strip()
             g.vendor = (
-                "Intel" if "Intel" in g.name else
+                "Intel"  if "Intel"  in g.name else
                 "NVIDIA" if "NVIDIA" in g.name or "nVidia" in g.name else
-                "AMD" if "AMD" in g.name or "Radeon" in g.name else
+                "AMD"    if "AMD"    in g.name or "Radeon" in g.name else
                 "Unknown"
             )
-            g.is_igpu = "Intel" in g.name and ("Iris" in g.name or "HD" in g.name)
-            g.generation = _gpu_generation(g.vendor, g.name)
+            g.is_igpu      = "Intel" in g.name and ("Iris" in g.name or "HD" in g.name)
+            g.generation   = _gpu_generation(g.vendor, g.name)
             gpus.append(g)
-
     return gpus
+
+
+def detect_gpus() -> list[GPUInfo]:
+    return _detect_gpus_windows() if IS_WINDOWS else _detect_gpus_linux()
 
 
 def _gpu_generation(vendor: str, name: str) -> str:
@@ -543,7 +648,58 @@ def _gpu_generation(vendor: str, name: str) -> str:
     return "Unknown"
 
 
-def detect_network() -> list[NetworkInfo]:
+def _net_chipset(vendor: str, name: str) -> str:
+    name_l = name.lower()
+    if vendor == "Intel":
+        if "ax" in name_l or "wi-fi 6" in name_l:        return "Intel Wi-Fi 6 (itlwm)"
+        if "wireless" in name_l or "wifi" in name_l:      return "Intel Wi-Fi (itlwm)"
+        if "i219" in name_l:                               return "Intel I219 Ethernet"
+        if "i211" in name_l:                               return "Intel I211 Ethernet"
+        if "i225" in name_l:                               return "Intel I225 Ethernet"
+        return "Intel Network"
+    if vendor == "Realtek":
+        if "8125" in name_l:                               return "Realtek 8125 (2.5GbE)"
+        if "811" in name_l or "8111" in name_l:           return "Realtek 8111 Ethernet"
+        return "Realtek Ethernet"
+    if vendor == "Broadcom":
+        if "bcm94360" in name_l or "bcm943602" in name_l: return "Broadcom (natively OOB)"
+        return "Broadcom"
+    if vendor == "Qualcomm":                               return "Qualcomm Atheros"
+    return vendor
+
+
+def _detect_network_windows() -> list[NetworkInfo]:
+    nets = []
+    # Use Win32_NetworkAdapter (physical adapters only, skip virtual/loopback)
+    rows = _wmic("path Win32_NetworkAdapter get Name,Manufacturer,AdapterType,"
+                 "NetConnectionID,PhysicalAdapter")
+    for r in rows:
+        if r.get("PhysicalAdapter", "").lower() != "true":
+            continue
+        name = r.get("Name", "").strip()
+        if not name:
+            continue
+        n = NetworkInfo()
+        n.name = name
+        mfr = r.get("Manufacturer", "")
+        n.vendor = (
+            "Intel"    if "Intel"    in mfr or "Intel"    in name else
+            "Realtek"  if "Realtek"  in mfr or "Realtek"  in name else
+            "Broadcom" if "Broadcom" in mfr or "Broadcom" in name else
+            "Qualcomm" if "Qualcomm" in mfr or "Qualcomm" in name or
+                          "Atheros"  in name else
+            mfr or "Unknown"
+        )
+        adapter_type = r.get("AdapterType", "").lower()
+        n.is_wifi = ("wireless" in adapter_type or "802.11" in adapter_type
+                     or "wi-fi" in name.lower() or "wireless" in name.lower()
+                     or " ax" in name.lower())
+        n.chipset_family = _net_chipset(n.vendor, n.name)
+        nets.append(n)
+    return nets
+
+
+def _detect_network_linux() -> list[NetworkInfo]:
     nets = []
     lspci_out = _run("lspci -vmm 2>/dev/null")
     current: dict = {}
@@ -553,16 +709,16 @@ def detect_network() -> list[NetworkInfo]:
             if "network" in cls or "ethernet" in cls:
                 n = NetworkInfo()
                 vendor_str = current.get("Vendor", "")
-                n.name = current.get("Device", "Unknown")
-                n.vendor = (
-                    "Intel" if "Intel" in vendor_str else
-                    "Realtek" if "Realtek" in vendor_str else
+                n.name     = current.get("Device", "Unknown")
+                n.vendor   = (
+                    "Intel"    if "Intel"    in vendor_str else
+                    "Realtek"  if "Realtek"  in vendor_str else
                     "Broadcom" if "Broadcom" in vendor_str else
                     "Qualcomm" if "Qualcomm" in vendor_str else
                     vendor_str
                 )
-                n.is_wifi = "wireless" in cls or "wifi" in n.name.lower() or \
-                            "wi-fi" in n.name.lower() or "ax" in n.name.lower()
+                n.is_wifi  = ("wireless" in cls or "wifi" in n.name.lower() or
+                               "wi-fi" in n.name.lower() or " ax" in n.name.lower())
                 n.chipset_family = _net_chipset(n.vendor, n.name)
                 nets.append(n)
             current = {}
@@ -570,64 +726,24 @@ def detect_network() -> list[NetworkInfo]:
             kv = line.split(":", 1)
             if len(kv) == 2:
                 current[kv[0].strip()] = kv[1].strip()
-
-    # Fallback
-    if not nets:
+    if not nets:  # Fallback
         for line in _run_lines("lspci 2>/dev/null | grep -iE 'network|ethernet'"):
             n = NetworkInfo()
-            n.name = line.split(":", 1)[-1].strip()
+            n.name   = line.split(":", 1)[-1].strip()
             n.vendor = (
-                "Intel" if "Intel" in n.name else
-                "Realtek" if "Realtek" in n.name else
+                "Intel"    if "Intel"    in n.name else
+                "Realtek"  if "Realtek"  in n.name else
                 "Broadcom" if "Broadcom" in n.name else
                 "Unknown"
             )
-            n.is_wifi = "wireless" in n.name.lower() or "wi-fi" in n.name.lower()
+            n.is_wifi        = "wireless" in n.name.lower() or "wi-fi" in n.name.lower()
             n.chipset_family = _net_chipset(n.vendor, n.name)
             nets.append(n)
     return nets
 
 
-def _net_chipset(vendor: str, name: str) -> str:
-    name_l = name.lower()
-    if vendor == "Intel":
-        if "ax" in name_l or "wi-fi 6" in name_l:       return "Intel Wi-Fi 6 (itlwm)"
-        if "wireless" in name_l or "wifi" in name_l:     return "Intel Wi-Fi (itlwm)"
-        if "i219" in name_l:                              return "Intel I219 Ethernet"
-        if "i211" in name_l:                              return "Intel I211 Ethernet"
-        if "i225" in name_l:                              return "Intel I225 Ethernet"
-        return "Intel Network"
-    if vendor == "Realtek":
-        if "8125" in name_l:                              return "Realtek 8125 (2.5GbE)"
-        if "811" in name_l or "8111" in name_l:          return "Realtek 8111 Ethernet"
-        return "Realtek Ethernet"
-    if vendor == "Broadcom":
-        if "bcm94360" in name_l or "bcm943602" in name_l: return "Broadcom (natively OOB)"
-        return "Broadcom"
-    if vendor == "Qualcomm":                               return "Qualcomm Atheros"
-    return vendor
-
-
-def detect_audio() -> list[AudioInfo]:
-    audios = []
-    lspci_out = _run("lspci -vmm 2>/dev/null")
-    current: dict = {}
-    for line in lspci_out.splitlines():
-        if line.strip() == "":
-            cls = current.get("Class", "").lower()
-            if "audio" in cls or "sound" in cls or "multimedia" in cls:
-                a = AudioInfo()
-                a.name = current.get("Device", "Unknown")
-                a.is_hda = "hda" in a.name.lower() or "high definition audio" in a.name.lower() \
-                           or "smart sound" in a.name.lower()
-                a.codec = _detect_audio_codec(a.name)
-                audios.append(a)
-            current = {}
-        else:
-            kv = line.split(":", 1)
-            if len(kv) == 2:
-                current[kv[0].strip()] = kv[1].strip()
-    return audios
+def detect_network() -> list[NetworkInfo]:
+    return _detect_network_windows() if IS_WINDOWS else _detect_network_linux()
 
 
 def _detect_audio_codec(name: str) -> str:
@@ -638,16 +754,85 @@ def _detect_audio_codec(name: str) -> str:
     return "Unknown"
 
 
-def detect_storage() -> StorageInfo:
+def _detect_audio_windows() -> list[AudioInfo]:
+    audios = []
+    rows = _wmic("path Win32_SoundDevice get Name,Manufacturer")
+    for r in rows:
+        name = r.get("Name", "").strip()
+        if not name:
+            continue
+        a = AudioInfo()
+        a.name   = name
+        a.is_hda = any(k in name.lower() for k in
+                       ("high definition audio", "hda", "smart sound", "realtek audio"))
+        a.codec  = _detect_audio_codec(name)
+        audios.append(a)
+    return audios
+
+
+def _detect_audio_linux() -> list[AudioInfo]:
+    audios = []
+    lspci_out = _run("lspci -vmm 2>/dev/null")
+    current: dict = {}
+    for line in lspci_out.splitlines():
+        if line.strip() == "":
+            cls = current.get("Class", "").lower()
+            if "audio" in cls or "sound" in cls or "multimedia" in cls:
+                a = AudioInfo()
+                a.name   = current.get("Device", "Unknown")
+                a.is_hda = ("hda" in a.name.lower() or
+                            "high definition audio" in a.name.lower() or
+                            "smart sound" in a.name.lower())
+                a.codec  = _detect_audio_codec(a.name)
+                audios.append(a)
+            current = {}
+        else:
+            kv = line.split(":", 1)
+            if len(kv) == 2:
+                current[kv[0].strip()] = kv[1].strip()
+    return audios
+
+
+def detect_audio() -> list[AudioInfo]:
+    return _detect_audio_windows() if IS_WINDOWS else _detect_audio_linux()
+
+
+def _detect_storage_windows() -> StorageInfo:
+    s = StorageInfo()
+    rows = _wmic("diskdrive get Name,MediaType,Model,Size")
+    for r in rows:
+        model      = r.get("Model", "").strip()
+        media_type = r.get("MediaType", "").lower()
+        if not model:
+            continue
+        s.drives.append(model)
+        if "nvme" in model.lower() or "nvme" in media_type:
+            s.has_nvme = True
+        elif "ssd" in model.lower() or "solid" in media_type:
+            s.has_sata = True
+        else:
+            s.has_sata = True   # HDD also counts as SATA for our purposes
+    # PowerShell fallback for NVMe
+    if not s.has_nvme:
+        nvme_check = _ps(
+            "Get-PhysicalDisk | Where-Object { $_.BusType -eq 'NVMe' } | Measure-Object | "
+            "Select-Object -ExpandProperty Count"
+        ).strip()
+        if nvme_check.isdigit() and int(nvme_check) > 0:
+            s.has_nvme = True
+    return s
+
+
+def _detect_storage_linux() -> StorageInfo:
     s = StorageInfo()
     lsblk_out = _run("lsblk -d -o NAME,ROTA,TYPE 2>/dev/null")
-    nvme_list = _run("ls /dev/nvme* 2>/dev/null")
+    nvme_list  = _run("ls /dev/nvme* 2>/dev/null")
     s.has_nvme = bool(nvme_list)
     for line in lsblk_out.splitlines():
         parts = line.split()
         if len(parts) >= 2 and parts[-1] == "disk":
             s.drives.append(parts[0])
-            if "0" in parts[1]:  # ROTA=0 means SSD/NVMe
+            if "0" in parts[1]:   # ROTA=0 → SSD/NVMe
                 if parts[0].startswith("nvme"):
                     s.has_nvme = True
                 else:
@@ -657,36 +842,78 @@ def detect_storage() -> StorageInfo:
     return s
 
 
-def detect_system_info() -> SystemInfo:
-    info = SystemInfo()
-    info.cpu = detect_cpu()
-    info.gpus = detect_gpus()
-    info.network = detect_network()
-    info.audio = detect_audio()
-    info.storage = detect_storage()
+def detect_storage() -> StorageInfo:
+    return _detect_storage_windows() if IS_WINDOWS else _detect_storage_linux()
 
+
+def _detect_system_info_windows(info: SystemInfo) -> None:
+    """Fill in Windows-specific system fields (RAM, MB, BIOS, UEFI, Secure Boot)."""
     # RAM
+    rows = _wmic("computersystem get TotalPhysicalMemory")
+    if rows:
+        try:
+            info.ram_gb = int(rows[0].get("TotalPhysicalMemory", 0)) / 1024 ** 3
+        except (ValueError, TypeError):
+            pass
+
+    # Motherboard
+    mb_rows = _wmic("baseboard get Manufacturer,Product")
+    if mb_rows:
+        r = mb_rows[0]
+        mb_vendor = r.get("Manufacturer", "").strip()
+        mb_name   = r.get("Product", "").strip()
+        info.motherboard = f"{mb_vendor} {mb_name}".strip() or "Unknown"
+
+    # BIOS
+    bios_rows = _wmic("bios get Manufacturer")
+    if bios_rows:
+        info.bios_vendor = bios_rows[0].get("Manufacturer", "Unknown").strip()
+
+    # UEFI — check firmware type via bcdedit or PowerShell
+    fw = _ps("(Get-ComputerInfo).BiosFirmwareType").strip().lower()
+    if fw:
+        info.uefi = "uefi" in fw
+    else:
+        # Fallback: bcdedit /enum firmware (requires admin)
+        bc = _run("bcdedit /enum firmware 2>nul").lower()
+        info.uefi = "uefi" in bc or not bc  # assume UEFI if bcdedit not accessible
+
+    # Secure Boot
+    sb = _ps("Confirm-SecureBootUEFI 2>$null").strip().lower()
+    info.secure_boot = sb == "true"
+
+
+def _detect_system_info_linux(info: SystemInfo) -> None:
+    """Fill in Linux-specific system fields (RAM, MB, BIOS, UEFI, Secure Boot)."""
     mem_info = _run("grep MemTotal /proc/meminfo 2>/dev/null")
     m = re.search(r"(\d+)\s*kB", mem_info)
     if m:
         info.ram_gb = int(m.group(1)) / 1024 / 1024
 
-    # Motherboard
-    mb = _run("cat /sys/class/dmi/id/board_name 2>/dev/null")
+    mb        = _run("cat /sys/class/dmi/id/board_name 2>/dev/null")
     mb_vendor = _run("cat /sys/class/dmi/id/board_vendor 2>/dev/null")
     info.motherboard = f"{mb_vendor} {mb}".strip() if mb else "Unknown"
-
-    # BIOS
     info.bios_vendor = _run("cat /sys/class/dmi/id/bios_vendor 2>/dev/null") or "Unknown"
-    info.uefi = os.path.exists("/sys/firmware/efi")
-
-    # Secure Boot
-    sb = _run("mokutil --sb-state 2>/dev/null")
+    info.uefi        = os.path.exists("/sys/firmware/efi")
+    sb               = _run("mokutil --sb-state 2>/dev/null")
     info.secure_boot = "enabled" in sb.lower()
 
-    info.os_name = platform.version()
-    info.hostname = platform.node()
 
+def detect_system_info() -> SystemInfo:
+    info = SystemInfo()
+    info.cpu     = detect_cpu()
+    info.gpus    = detect_gpus()
+    info.network = detect_network()
+    info.audio   = detect_audio()
+    info.storage = detect_storage()
+
+    if IS_WINDOWS:
+        _detect_system_info_windows(info)
+    else:
+        _detect_system_info_linux(info)
+
+    info.os_name  = platform.version()
+    info.hostname = platform.node()
     return info
 
 
