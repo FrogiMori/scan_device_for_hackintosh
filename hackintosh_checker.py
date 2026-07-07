@@ -289,16 +289,18 @@ MACOS_VERSIONS: list[MacOSVersion] = [
 # ═══════════════════════════════════════════════════════════════
 
 IS_WINDOWS = platform.system() == "Windows"
+IS_MACOS   = platform.system() == "Darwin"
+# Attribute only exists on Windows; define a safe fallback for other platforms
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _run(cmd: str, default: str = "") -> str:
     """Run a shell command and return stdout, or default on error."""
     try:
-        result = subprocess.run(
-            cmd, shell=True, capture_output=True, text=True, timeout=10,
-            # Suppress Windows console windows when running subprocesses
-            creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0,
-        )
+        kwargs: dict = dict(shell=True, capture_output=True, text=True, timeout=10)
+        if IS_WINDOWS:
+            kwargs["creationflags"] = _CREATE_NO_WINDOW
+        result = subprocess.run(cmd, **kwargs)
         return result.stdout.strip()
     except Exception:
         return default
@@ -329,6 +331,15 @@ def _wmic(query: str) -> list[dict]:
 def _ps(expression: str) -> str:
     """Run a PowerShell one-liner (Windows fallback)."""
     return _run(f'powershell -NoProfile -NonInteractive -Command "{expression}"')
+
+
+def _sp_json(datatype: str) -> dict:
+    """Run system_profiler in JSON mode (macOS only) and return parsed dict."""
+    out = _run(f"system_profiler {datatype} -json 2>/dev/null")
+    try:
+        return json.loads(out)
+    except (json.JSONDecodeError, ValueError):
+        return {}
 
 
 def _infer_cpu_flags_from_gen(cpu: "CPUInfo") -> None:
@@ -435,8 +446,66 @@ def _detect_cpu_linux() -> "CPUInfo":
     return cpu
 
 
+def _detect_cpu_macos() -> "CPUInfo":
+    cpu = CPUInfo()
+
+    # Brand / model string
+    cpu.brand = _run("sysctl -n machdep.cpu.brand_string 2>/dev/null").strip()
+    if not cpu.brand:
+        cpu.brand = _run("sysctl -n hw.model 2>/dev/null").strip() or "Unknown"
+
+    brand_l = cpu.brand.lower()
+    if "intel" in brand_l:
+        cpu.vendor = "Intel"
+    elif "amd" in brand_l:
+        cpu.vendor = "AMD"
+    elif "apple" in brand_l:
+        cpu.vendor = "Apple Silicon"
+    else:
+        cpu.vendor = _run("sysctl -n machdep.cpu.vendor 2>/dev/null").strip() or "Unknown"
+
+    # Core / thread counts
+    try: cpu.cores   = int(_run("sysctl -n hw.physicalcpu 2>/dev/null") or 0)
+    except ValueError: pass
+    try: cpu.threads = int(_run("sysctl -n hw.logicalcpu 2>/dev/null") or 0)
+    except ValueError: pass
+
+    # Max frequency (sysctl reports Hz; Apple Silicon may return 0 — skip gracefully)
+    try:
+        freq_hz = int(_run("sysctl -n hw.cpufrequency_max 2>/dev/null") or 0)
+        if freq_hz:
+            cpu.max_mhz = freq_hz / 1_000_000
+    except ValueError:
+        pass
+
+    # VT-x / Hypervisor support
+    hv = _run("sysctl -n kern.hv_support 2>/dev/null").strip()
+    cpu.vt_x = hv == "1"
+
+    # CPU instruction set flags via sysctl
+    flags_str  = _run("sysctl -n machdep.cpu.features 2>/dev/null").upper()
+    leaf7_str  = _run("sysctl -n machdep.cpu.leaf7_features 2>/dev/null").upper()
+    all_flags  = flags_str + " " + leaf7_str
+    cpu.has_sse4_2 = "SSE4.2" in all_flags
+    cpu.has_avx    = "AVX1.0" in all_flags or " AVX " in all_flags
+    cpu.has_avx2   = "AVX2" in all_flags
+    cpu.has_aes    = "AES" in all_flags
+
+    if cpu.vendor == "Intel":
+        cpu.generation = _detect_intel_gen(cpu.brand, cpu.family, cpu.model_num)
+    elif cpu.vendor == "AMD":
+        cpu.generation = _detect_amd_gen(cpu.brand)
+    # Apple Silicon has no Intel generation
+
+    # Infer any still-unknown flags from generation
+    _infer_cpu_flags_from_gen(cpu)
+    return cpu
+
+
 def detect_cpu() -> CPUInfo:
-    return _detect_cpu_windows() if IS_WINDOWS else _detect_cpu_linux()
+    if IS_WINDOWS: return _detect_cpu_windows()
+    if IS_MACOS:   return _detect_cpu_macos()
+    return _detect_cpu_linux()
 
 
 def _detect_intel_gen(brand: str, family: int, model: int) -> int:
@@ -609,8 +678,33 @@ def _detect_gpus_linux() -> list[GPUInfo]:
     return gpus
 
 
+def _detect_gpus_macos() -> list[GPUInfo]:
+    gpus = []
+    data = _sp_json("SPDisplaysDataType")
+    for entry in data.get("SPDisplaysDataType", []):
+        g = GPUInfo()
+        g.name   = entry.get("sppci_model") or entry.get("_name", "Unknown")
+        vendor_s = entry.get("spdisplays_vendor", "").lower()
+        g.vendor = (
+            "Intel"  if "intel"  in vendor_s or "intel"  in g.name.lower() else
+            "AMD"    if "amd"    in vendor_s or "radeon" in g.name.lower() else
+            "NVIDIA" if "nvidia" in vendor_s or "nvidia" in g.name.lower() else
+            "Apple"  if "apple"  in vendor_s or "apple"  in g.name.lower() else
+            vendor_s.title() or "Unknown"
+        )
+        g.is_igpu = (
+            g.vendor in ("Intel", "Apple") or
+            any(k in g.name for k in ("Iris", "UHD", "HD Graphics", "M1", "M2", "M3", "M4"))
+        )
+        g.generation = _gpu_generation(g.vendor, g.name)
+        gpus.append(g)
+    return gpus
+
+
 def detect_gpus() -> list[GPUInfo]:
-    return _detect_gpus_windows() if IS_WINDOWS else _detect_gpus_linux()
+    if IS_WINDOWS: return _detect_gpus_windows()
+    if IS_MACOS:   return _detect_gpus_macos()
+    return _detect_gpus_linux()
 
 
 def _gpu_generation(vendor: str, name: str) -> str:
@@ -742,8 +836,50 @@ def _detect_network_linux() -> list[NetworkInfo]:
     return nets
 
 
+def _detect_network_macos() -> list[NetworkInfo]:
+    nets = []
+    data = _sp_json("SPNetworkDataType")
+    for entry in data.get("SPNetworkDataType", []):
+        iface_type = entry.get("spnetworkinterface_type", "").lower()
+        hw_addr    = entry.get("Ethernet", {}).get("MACAddress", "")
+        name       = entry.get("_name", entry.get("interface", "Unknown"))
+        # Skip loopback / virtual
+        if "loopback" in iface_type or name.startswith("lo"):
+            continue
+        n = NetworkInfo()
+        n.name    = name
+        n.is_wifi = "wi-fi" in iface_type or "airport" in iface_type or name.lower() == "wi-fi"
+        # Detect vendor from interface name and hardware info
+        hw_info   = entry.get("IPv4", {}).get("InterfaceName", "") or name
+        sp_hw     = _run(f"system_profiler SPNetworkDataType 2>/dev/null | grep -A5 '{name}'")
+        n.vendor  = (
+            "Intel"    if "Intel"    in sp_hw else
+            "Broadcom" if "Broadcom" in sp_hw else
+            "Realtek"  if "Realtek"  in sp_hw else
+            "Qualcomm" if "Qualcomm" in sp_hw or "Atheros" in sp_hw else
+            "Apple"    if "Apple"    in sp_hw else
+            "Unknown"
+        )
+        n.chipset_family = _net_chipset(n.vendor, n.name)
+        nets.append(n)
+    # Fallback: use networksetup
+    if not nets:
+        for line in _run_lines("networksetup -listallnetworkservices 2>/dev/null"):
+            if line.startswith("*") or not line.strip():
+                continue
+            n = NetworkInfo()
+            n.name    = line.strip()
+            n.is_wifi = "wi-fi" in line.lower() or "airport" in line.lower()
+            n.vendor  = "Unknown"
+            n.chipset_family = "Unknown"
+            nets.append(n)
+    return nets
+
+
 def detect_network() -> list[NetworkInfo]:
-    return _detect_network_windows() if IS_WINDOWS else _detect_network_linux()
+    if IS_WINDOWS: return _detect_network_windows()
+    if IS_MACOS:   return _detect_network_macos()
+    return _detect_network_linux()
 
 
 def _detect_audio_codec(name: str) -> str:
@@ -793,8 +929,23 @@ def _detect_audio_linux() -> list[AudioInfo]:
     return audios
 
 
+def _detect_audio_macos() -> list[AudioInfo]:
+    audios = []
+    data   = _sp_json("SPAudioDataType")
+    for entry in data.get("SPAudioDataType", []):
+        a        = AudioInfo()
+        a.name   = entry.get("_name", "Unknown")
+        a.is_hda = any(k in a.name.lower() for k in
+                       ("high definition audio", "hda", "realtek", "cirrus"))
+        a.codec  = _detect_audio_codec(a.name)
+        audios.append(a)
+    return audios
+
+
 def detect_audio() -> list[AudioInfo]:
-    return _detect_audio_windows() if IS_WINDOWS else _detect_audio_linux()
+    if IS_WINDOWS: return _detect_audio_windows()
+    if IS_MACOS:   return _detect_audio_macos()
+    return _detect_audio_linux()
 
 
 def _detect_storage_windows() -> StorageInfo:
@@ -842,8 +993,34 @@ def _detect_storage_linux() -> StorageInfo:
     return s
 
 
+def _detect_storage_macos() -> StorageInfo:
+    s    = StorageInfo()
+    data = _sp_json("SPStorageDataType")
+    for vol in data.get("SPStorageDataType", []):
+        bsd  = vol.get("bsd_name", "")
+        name = vol.get("_name", bsd)
+        if name and name not in s.drives:
+            s.drives.append(name)
+        medium = vol.get("spstorage_solid_state", "").lower()
+        if "yes" in medium or "true" in medium:
+            if bsd.startswith("disk") and "nvme" in _run(
+                    f"diskutil info {bsd} 2>/dev/null").lower():
+                s.has_nvme = True
+            else:
+                s.has_sata = True
+        else:
+            s.has_sata = True
+    # Quick NVMe check via diskutil list
+    if not s.has_nvme:
+        disk_list = _run("diskutil list 2>/dev/null").lower()
+        s.has_nvme = "apple ssd" in disk_list or "nvme" in disk_list
+    return s
+
+
 def detect_storage() -> StorageInfo:
-    return _detect_storage_windows() if IS_WINDOWS else _detect_storage_linux()
+    if IS_WINDOWS: return _detect_storage_windows()
+    if IS_MACOS:   return _detect_storage_macos()
+    return _detect_storage_linux()
 
 
 def _detect_system_info_windows(info: SystemInfo) -> None:
@@ -899,6 +1076,30 @@ def _detect_system_info_linux(info: SystemInfo) -> None:
     info.secure_boot = "enabled" in sb.lower()
 
 
+def _detect_system_info_macos(info: SystemInfo) -> None:
+    """Fill in macOS-specific system fields using system_profiler and sysctl."""
+    # RAM
+    try:
+        mem_bytes     = int(_run("sysctl -n hw.memsize 2>/dev/null") or 0)
+        info.ram_gb   = mem_bytes / 1024 ** 3
+    except ValueError:
+        pass
+
+    # Motherboard / machine model from system_profiler
+    hw_data = _sp_json("SPHardwareDataType")
+    hw      = hw_data.get("SPHardwareDataType", [{}])[0]
+    model   = hw.get("machine_model", "")          # e.g. MacBookPro18,1
+    cpu_s   = hw.get("cpu_type", "")               # e.g. Apple M2 Pro
+    info.motherboard = hw.get("_name", model) or model or "Unknown"
+    info.bios_vendor = "Apple EFI"                 # Macs always use Apple EFI
+    info.uefi        = True                        # All modern Macs are UEFI (EFI)
+
+    # Secure Boot (only relevant on Apple Silicon / T2 Macs)
+    sb = _run("nvram 94b73556-2197-4702-82a8-3e1337dafbfb:AppleSecureBootPolicy 2>/dev/null")
+    # AppleSecureBootPolicy %01 = full, %00 = off; absence = Intel without T2 (no SB)
+    info.secure_boot = "%01" in sb or "%02" in sb
+
+
 def detect_system_info() -> SystemInfo:
     info = SystemInfo()
     info.cpu     = detect_cpu()
@@ -909,6 +1110,8 @@ def detect_system_info() -> SystemInfo:
 
     if IS_WINDOWS:
         _detect_system_info_windows(info)
+    elif IS_MACOS:
+        _detect_system_info_macos(info)
     else:
         _detect_system_info_linux(info)
 
