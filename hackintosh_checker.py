@@ -310,8 +310,81 @@ def _run_lines(cmd: str) -> list[str]:
     return [l for l in _run(cmd).splitlines() if l.strip()]
 
 
+def _cim(wmi_class: str, properties: str) -> list[dict]:
+    """
+    Query a WMI/CIM class via PowerShell Get-CimInstance and return a list of
+    property dicts.  This works on all Windows versions including Windows 11
+    24H2+ where `wmic` has been removed.
+    """
+    import base64
+    props = ", ".join(f'"{p}"' for p in properties.split(","))
+    script = (
+        f"Get-CimInstance -ClassName {wmi_class} | "
+        f"Select-Object -Property {props} | "
+        "ConvertTo-Json -Compress -Depth 2"
+    )
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    out = _run(
+        f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
+    )
+    if not out:
+        return []
+    try:
+        data = json.loads(out)
+        # ConvertTo-Json returns a single object (not array) when only 1 result
+        if isinstance(data, dict):
+            data = [data]
+        return [{k: (str(v) if v is not None else "") for k, v in row.items()}
+                for row in data if isinstance(row, dict)]
+    except (json.JSONDecodeError, ValueError):
+        return []
+
+
+_WMIC_ALIAS_TO_CIM: dict = {
+    # wmic short alias  →  CIM/WMI class name
+    "cpu":               "Win32_Processor",
+    "computersystem":    "Win32_ComputerSystem",
+    "baseboard":         "Win32_BaseBoard",
+    "bios":              "Win32_BIOS",
+    "diskdrive":         "Win32_DiskDrive",
+    "memorychip":        "Win32_PhysicalMemory",
+    "physicalmemory":    "Win32_PhysicalMemory",
+    "sounddevice":       "Win32_SoundDevice",
+    "networkadapter":    "Win32_NetworkAdapter",
+    "videocontroller":   "Win32_VideoController",
+    # full Win32_* names pass through unchanged
+}
+
+
 def _wmic(query: str) -> list[dict]:
-    """Run a WMIC query and return list of dicts (Windows only)."""
+    """
+    Run a WMIC query and return list of dicts.
+    Tries Get-CimInstance (PowerShell) first since wmic is deprecated/removed
+    on Windows 11 24H2+; falls back to raw wmic for older systems.
+
+    The `query` format expected here is:  <class_path> get <prop1,prop2,...>
+    e.g. "cpu get Name,Manufacturer,NumberOfCores"
+         "path Win32_VideoController get Name,AdapterCompatibility"
+    """
+    # Parse legacy wmic query string into class + properties
+    # Pattern:  [path ][class] get [props]
+    q = query.strip()
+    # Strip optional leading 'path '
+    if q.lower().startswith("path "):
+        q = q[5:].strip()
+    get_idx = q.lower().find(" get ")
+    if get_idx != -1:
+        raw_class  = q[:get_idx].strip()
+        properties = q[get_idx + 5:].strip()
+        # Resolve short wmic alias → full CIM class name
+        cim_class = _WMIC_ALIAS_TO_CIM.get(
+            raw_class.lower(),
+            raw_class  # already a full Win32_* name
+        )
+        rows = _cim(cim_class, properties)
+        if rows:  # CIM succeeded
+            return rows
+    # Fall back to legacy wmic (Windows 10 / older)
     out = _run(f'wmic {query} /format:list')
     records, current = [], {}
     for line in out.splitlines():
@@ -329,8 +402,12 @@ def _wmic(query: str) -> list[dict]:
 
 
 def _ps(expression: str) -> str:
-    """Run a PowerShell one-liner (Windows fallback)."""
-    return _run(f'powershell -NoProfile -NonInteractive -Command "{expression}"')
+    """Run a PowerShell one-liner and return stdout."""
+    import base64
+    encoded = base64.b64encode(expression.encode("utf-16-le")).decode("ascii")
+    return _run(
+        f"powershell -NoProfile -NonInteractive -EncodedCommand {encoded}"
+    )
 
 
 def _sp_json(datatype: str) -> dict:
@@ -1560,7 +1637,7 @@ def display_top_picks(scores: list[CompatScore], console: "Console") -> None:
         title_txt = f"{medal}  {v.name} — {v.codename}  [{grade_style}]{cs.grade}  {cs.total}/100[/{grade_style}]"
         body = Text()
         body.append(f"  Score: ", style="dim")
-        body.append(f"[{bar_color}]{bar}[/{bar_color}]", style="")
+        body += Text.from_markup(f"[{bar_color}]{bar}[/{bar_color}]")
         body.append(f"  {cs.total}/100\n")
         body.append(f"  {cs.verdict}\n", style="italic")
 
@@ -1592,8 +1669,8 @@ def display_detail(cs: CompatScore, console: "Console") -> None:
     title = f"  {v.name} — {v.codename} ({v.year})  "
     body = Text()
     body.append(f"  Overall Score : ", style="dim")
-    body.append(f"[{bar_color}]{bar}[/{bar_color}] ", style="")
-    body.append(f"[{grade_style}]{cs.total}/100  Grade: {cs.grade}[/{grade_style}]\n\n")
+    body += Text.from_markup(f"[{bar_color}]{bar}[/{bar_color}] ")
+    body += Text.from_markup(f"[{grade_style}]{cs.total}/100  Grade: {cs.grade}[/{grade_style}]\n\n")
 
     sub_scores = [
         ("CPU", cs.cpu_score, 40, "cyan"),
@@ -1605,8 +1682,8 @@ def display_detail(cs: CompatScore, console: "Console") -> None:
     for label, score, max_s, col in sub_scores:
         sbar, scol = make_bar(score, max_s, 15)
         body.append(f"  {label:<12}: ", style="dim")
-        body.append(f"[{scol}]{sbar}[/{scol}] ", style="")
-        body.append(f"[{col}]{score}/{max_s}[/{col}]\n")
+        body += Text.from_markup(f"[{scol}]{sbar}[/{scol}] ")
+        body += Text.from_markup(f"[{col}]{score}/{max_s}[/{col}]\n")
 
     body.append(f"\n  Verdict : ", style="dim")
     body.append(f"[{grade_style}]{cs.verdict}[/{grade_style}]\n")
