@@ -4,6 +4,7 @@
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux-orange?logo=linux&logoColor=white)
+![Platform](https://img.shields.io/badge/Platform-Windows-blue?logo=windows&logoColor=white)
 ![License](https://img.shields.io/badge/License-MIT-green)
 ![Dependencies](https://img.shields.io/badge/Dependencies-rich%20%7C%20psutil-purple)
 
@@ -44,7 +45,7 @@
 | Python | 3.10+ |
 | `rich` | 13.0+ |
 | `psutil` | 5.0+ |
-| OS | Linux (any distro) |
+| OS | Linux (any distro) , Window 10,11 |
 
 System tools used (standard on all major distros):
 `lscpu`, `lspci`, `lsblk`, `dmidecode` (optional), `mokutil` (optional for Secure Boot detection)
