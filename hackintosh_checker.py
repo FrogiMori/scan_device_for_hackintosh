@@ -11,7 +11,7 @@ version from 10.0 to 26.0 for Hackintosh use.
 Usage:
     python3 hackintosh_checker.py [--json] [--version VER] [--no-color]
 """
-
+# pyrefly: ignore [missing-imprt]
 import os
 import re
 import sys
@@ -35,10 +35,11 @@ try:
     from rich.progress import track
     from rich import box
     from rich.columns import Columns
+    # pyrefly: ignore [missing-import]
     from rich.rule import Rule
     from rich.style import Style
     RICH = True
-except ImportError:
+except Exception:  # catches ImportError, ModuleNotFoundError, AttributeError, etc.
     RICH = False
 
 
