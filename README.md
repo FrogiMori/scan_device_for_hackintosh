@@ -50,6 +50,8 @@
 System tools used (standard on all major distros):
 `lscpu`, `lspci`, `lsblk`, `dmidecode` (optional), `mokutil` (optional for Secure Boot detection)
 
+If python version under 10 , the UI may not display
+
 ---
 
 ## 🚀 Installation
