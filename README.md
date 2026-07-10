@@ -1,6 +1,6 @@
 # 🍎 Hackintosh Compatibility Checker
 
-> A terminal tool that detects your PC hardware and rates its Hackintosh compatibility for every macOS version from **10.0 (Cheetah) → 26.0**, complete with scores, grades, and actionable notes.
+> A terminal tool that detects your PC hardware and rates its Hackintosh compatibility for every macOS version from **10.0 (Cheetah) → 26.0 (Tahoe)**, complete with scores, grades, and actionable notes.
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python&logoColor=white)
 ![Platform](https://img.shields.io/badge/Platform-Linux-orange?logo=linux&logoColor=white)
